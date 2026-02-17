@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { SerialPort } from 'serialport';
+import { Mutex } from './Util';
 
 const NO_COLOR = '\x1b[0m';
 const GREEN = '\x1b[1;36m';
@@ -14,13 +15,16 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
 
     private port: SerialPort | null = null;
     private inputLine: string = '';
+    private readingRest: string = '';
 
     private isClosing = false;
     private isConnected = true;
-    private exitPending = false;
+    private exitPending = false
 
-    private cursorVerPos = 0;
-    private rowCont: number = 0;
+    private cursorVerPos = 1;
+    private dimension: vscode.TerminalDimensions = { rows: 0, columns: 0 };
+
+    private mutex: Mutex = new Mutex();
 
     constructor(
         private readonly portPath: string,
@@ -34,7 +38,7 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
             this.setDimensions(initialDimensions);
         }
 
-        // this.writeEmitter.fire('\x1b[?25l');    // hiding cursor
+        this.writeEmitter.fire('\x1b[?25l');    // hiding cursor
         this.writeHeader();
     }
 
@@ -54,19 +58,21 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
             this.port = null;
         }
 
-        const exitMsg = `${YELLOW}[CONNECTION CLOSED - Press any key to close terminal]${NO_COLOR}`;
-        this.writeOnBottom(exitMsg);
+        this.updateFooter();
     }
 
     setDimensions(dimensions: vscode.TerminalDimensions): void {
-        
-        this.rowCont = dimensions.rows;
+        let lastRowCount = this.dimension.rows;
+        this.dimension = dimensions;
 
-        if (this.isConnected) {
-            this.writeInputLine();
+        // Remove footer artifacts
+        if (dimensions.rows - lastRowCount >= 0) {
+            this.writeEmitter.fire(`\x1b[s\x1b[${lastRowCount};0H\x1b[0J\x1b[u`);   // delete old footers
         } else {
-            this.writeDisconnectMsg();
+            this.writeEmitter.fire('\x1b[s\x1b[999;0H\n\x1b[u');    // new line for footer
         }
+
+        this.updateFooter();
     }
 
     handleInput(data: string): void {
@@ -86,15 +92,11 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
         // Ctrl-C: Clear everything and show only input line
         if (data === '\x03') {
             this.writeOnScreen('\x1b[2J\x1b[3J\x1b[H'); // Clear screen and go to top
-            this.cursorVerPos = 0;
+            this.cursorVerPos = 1;
+            this.inputLine = '';
 
             this.writeHeader();
-
-            if (this.isConnected) {
-                this.writeInputLine();
-            } else {
-                this.writeDisconnectMsg();
-            }
+            this.updateFooter();
 
             return;
         }
@@ -109,14 +111,19 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
                 this.port.write('\r\n');
             }
             this.inputLine = '';
-            this.writeInputLine();
+
+            this.updateFooter();
         }
 
         // Backspace: Remove last character from input line
         if (data === '\x7f' || data === '\b') {
+            if (this.port && this.port.isOpen) {
+                this.port.write('\b');
+            }
             if (this.inputLine.length > 0) {
                 this.inputLine = this.inputLine.slice(0, -1);
-                this.writeInputLine();
+
+                this.updateFooter();
             }
             return;
         }
@@ -130,7 +137,7 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
                 this.port.write(data);
             }
 
-            this.writeInputLine();
+            this.updateFooter();
         }
     }
 
@@ -166,12 +173,16 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
         }
     }
 
-    private readingRest: string = "";
-    private handleSerialData(data: Buffer): void {
-        // Convert buffer to string and strip non-printable characters except CR, LF, TAB
-        let text = this.readingRest + data.toString('utf8').replace(/(?<!\r)\n/g, '\r\n');
-        // text = text.replace(/[^\x20-\x7E\r\n\t]/g, '');
+    private handleError(error: Error): void {
+        const errorMsg = `\x1b[1;31m[ERROR] ${error.message}${NO_COLOR}`;
+        this.writeOnScreen('\r\n' + errorMsg + '\r\n');
 
+        this.close();
+    }
+
+    private handleSerialData(data: Buffer): void {
+
+        let text = this.readingRest + data.toString('utf8').replace(/(?<!\r)\n/g, '\r\n');
         this.readingRest = '';
 
         if (text.endsWith('\n')) {
@@ -185,9 +196,6 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
             }
             this.readingRest = lines.at(-1) ?? '';
         }
-
-        // Update
-        // this.writeInputLine();
     }
 
     private handleDisconnect(): void {
@@ -196,10 +204,9 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
         }
 
         this.isConnected = false;
+        this.updateFooter();
 
-        this.writeDisconnectMsg();
-
-        this.attemptReconnect(100);
+        this.attemptReconnect(500);
     }
 
     private attemptReconnect(delay: number): void {
@@ -215,46 +222,71 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
                 } else {
                     // Reconnected
                     this.isConnected = true;
-                    this.writeInputLine();
+                    this.updateFooter();
                 }
             });
         }, delay);
     }
 
-    private handleError(error: Error): void {
-        const errorMsg = `\x1b[1;31m[ERROR] ${error.message}${NO_COLOR}`;
-
-        this.writeOnScreen('\r\n' + errorMsg + '\r\n');
-
-        this.close();
-    }
-
-    private writeOnScreen(data: string) {
+    private writeOnScreen(data: string): void {
+        this.mutex.lock();
         for (var i = 0; i < data.length; i++) {
             var char = data.charAt(i);
 
             if (char === '\n') {
                 this.cursorVerPos += 1;
 
-                if (this.cursorVerPos >= this.rowCont - 1) {
+                if (this.cursorVerPos >= this.dimension.rows) {
                     this.cursorVerPos--;
-                    const prompt = `${GREEN}>${NO_COLOR} ${this.inputLine}`;
-                    this.writeEmitter.fire(`\x1b[s\n\x1b[2K\r\n${prompt}\x1b[u\x1b[B`);
-                    // this.writeInputLine();
+                    this.writeEmitter.fire(`\n\x1b[2K\n${this.inputLineFooter()}\x1b[${this.cursorVerPos}H`);
+                    // this.updateFooter(true);
                     return;
                 }
             }
 
             this.writeEmitter.fire(data[i]);
         }
-
+        this.mutex.unlock();
     }
 
-    private writeOnBottom(data: string): void {
-        this.writeEmitter.fire('\x1b[s'); // Save cursor position
-        this.writeEmitter.fire('\x1b[999;0H\x1b[2K'); // Move to bottom
-        this.writeEmitter.fire(data);
-        this.writeEmitter.fire('\x1b[u'); // Restore cursor position
+    private updateFooter(noLock: boolean = false): void {
+        if (!noLock) {
+            this.mutex.lock();
+        }
+
+        let msg = '';
+
+        // Closing footer
+        if (this.isClosing) {
+            msg = `${YELLOW}[CONNECTION CLOSED - Press any key to close terminal]${NO_COLOR}`;
+        }
+
+        // Disconnected footer
+        else if (!this.isConnected) {
+            msg = `${YELLOW}[DISCONNECTED - Waiting for device...]${NO_COLOR}`;
+        }
+
+        // Input line footer
+        else {
+            msg = this.inputLineFooter();
+        }
+
+        this.writeEmitter.fire('\x1b[s\x1b[999;0H\x1b[2K');
+        this.writeEmitter.fire(msg);
+        this.writeEmitter.fire('\x1b[u');
+
+        if (!noLock) {
+            this.mutex.unlock();
+        }
+    }
+
+    private inputLineFooter(): string {
+        const maxLength = this.dimension.columns - 5;
+        if (this.inputLine.length < maxLength) {
+            return `${GREEN}>${NO_COLOR} ${this.inputLine}`;
+        } else {
+            return `${GREEN}>${NO_COLOR} ...${this.inputLine.slice(this.inputLine.length - maxLength + 3, this.inputLine.length)}`;
+        }
     }
 
     private writeHeader(): void {
@@ -275,20 +307,6 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
         const bottomLine = `${GREEN}└${'─'.repeat(headerWidth - 2)}┘${NO_COLOR}`;
 
         this.writeOnScreen(topLine + '\r\n' + contentLine + '\r\n' + bottomLine + '\r\n');
-    }
-
-    private writeDisconnectMsg() {
-        const msg = `${YELLOW}[DISCONNECTED - Waiting for device...]${NO_COLOR}`;
-        this.writeOnBottom(msg);
-    }
-
-    private writeInputLine(): void {
-        if (!this.isConnected) {
-            return;
-        }
-
-        const prompt = `${GREEN}>${NO_COLOR} ${this.inputLine}`;
-        this.writeOnBottom(prompt);
     }
 
 }
