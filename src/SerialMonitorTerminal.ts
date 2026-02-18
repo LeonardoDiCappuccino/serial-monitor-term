@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 import { SerialPort } from 'serialport';
-import { Mutex } from './Util';
 
 const NO_COLOR = '\x1b[0m';
 const GREEN = '\x1b[1;36m';
@@ -24,7 +23,7 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
     private cursorVerPos = 1;
     private dimension: vscode.TerminalDimensions = { rows: 0, columns: 0 };
 
-    private mutex: Mutex = new Mutex();
+    private writeQueue: Promise<void> = Promise.resolve();
 
     constructor(
         private readonly portPath: string,
@@ -38,7 +37,7 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
             this.setDimensions(initialDimensions);
         }
 
-        this.writeEmitter.fire('\x1b[?25l');    // hiding cursor
+        // this.writeEmitter.fire('\x1b[?25l');    // hiding cursor
         this.writeHeader();
     }
 
@@ -62,15 +61,21 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
     }
 
     setDimensions(dimensions: vscode.TerminalDimensions): void {
-        let lastRowCount = this.dimension.rows;
+        const lastRowCount = this.dimension.rows;
         this.dimension = dimensions;
 
-        // Remove footer artifacts
-        if (dimensions.rows - lastRowCount >= 0) {
-            this.writeEmitter.fire(`\x1b[s\x1b[${lastRowCount};0H\x1b[0J\x1b[u`);   // delete old footers
-        } else {
-            this.writeEmitter.fire('\x1b[s\x1b[999;0H\n\x1b[u');    // new line for footer
-        }
+        this.enqueueWrite(() => {
+            // Remove footer artifacts from old position
+            if (lastRowCount > 0) {
+                this.writeEmitter.fire(`\x1b[s\x1b[${lastRowCount};0H\x1b[0J\x1b[u`);
+            }
+
+            // Adjust cursor position
+            if (this.cursorVerPos >= dimensions.rows) {
+                this.cursorVerPos = dimensions.rows - 1;
+                this.writeEmitter.fire('\x1b[2K\n\x1b[A');
+            }
+        });
 
         this.updateFooter();
     }
@@ -192,7 +197,7 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
             const lines = text.split('\n');
             let splitData = lines.slice(0, -1).join('\n');
             if (splitData !== '') {
-                this.writeEmitter.fire(splitData + '\n');
+                this.writeOnScreen(splitData + '\n');
             }
             this.readingRest = lines.at(-1) ?? '';
         }
@@ -229,55 +234,64 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
     }
 
     private writeOnScreen(data: string): void {
-        this.mutex.lock();
-        for (var i = 0; i < data.length; i++) {
-            var char = data.charAt(i);
+        this.enqueueWrite(() => {
+            for (let i = 0; i < data.length; i++) {
+                const char = data.charAt(i);
 
-            if (char === '\n') {
-                this.cursorVerPos += 1;
+                if (char === '\x1b' && data.charAt(i + 1) === '[') {
+                    const endIndex = this.handleAnsiSequence(data, i);
 
-                if (this.cursorVerPos >= this.dimension.rows) {
-                    this.cursorVerPos--;
-                    this.writeEmitter.fire(`\n\x1b[2K\n${this.inputLineFooter()}\x1b[${this.cursorVerPos}H`);
-                    // this.updateFooter(true);
-                    return;
+                    if (endIndex > i) {
+                        this.writeEmitter.fire(data.slice(i, endIndex + 1));
+                        i = endIndex;
+
+                        if (this.cursorVerPos >= this.dimension.rows) {
+                            this.cursorVerPos--;
+                            this.writeEmitter.fire('\x1b[A');
+                        }
+
+                        continue;
+                    }
                 }
-            }
 
-            this.writeEmitter.fire(data[i]);
-        }
-        this.mutex.unlock();
+                if (char === '\n') {
+                    this.cursorVerPos = Math.min(this.cursorVerPos + 1, this.dimension.rows);
+
+                    if (this.cursorVerPos >= this.dimension.rows) {
+                        this.cursorVerPos--;
+                        this.writeEmitter.fire(`\n\x1b[2K\n${this.inputLineFooter()}\x1b[${this.cursorVerPos}H`);
+                        continue;
+                    }
+                }
+
+                this.writeEmitter.fire(data[i]);
+            }
+        });
     }
 
-    private updateFooter(noLock: boolean = false): void {
-        if (!noLock) {
-            this.mutex.lock();
-        }
+    private updateFooter(): void {
+        this.enqueueWrite(() => {
+            let msg = '';
 
-        let msg = '';
+            // Closing footer
+            if (this.isClosing) {
+                msg = `${YELLOW}[CONNECTION CLOSED - Press any key to close terminal]${NO_COLOR}`;
+            }
 
-        // Closing footer
-        if (this.isClosing) {
-            msg = `${YELLOW}[CONNECTION CLOSED - Press any key to close terminal]${NO_COLOR}`;
-        }
+            // Disconnected footer
+            else if (!this.isConnected) {
+                msg = `${YELLOW}[DISCONNECTED - Waiting for device...]${NO_COLOR}`;
+            }
 
-        // Disconnected footer
-        else if (!this.isConnected) {
-            msg = `${YELLOW}[DISCONNECTED - Waiting for device...]${NO_COLOR}`;
-        }
+            // Input line footer
+            else {
+                msg = this.inputLineFooter();
+            }
 
-        // Input line footer
-        else {
-            msg = this.inputLineFooter();
-        }
-
-        this.writeEmitter.fire('\x1b[s\x1b[999;0H\x1b[2K');
-        this.writeEmitter.fire(msg);
-        this.writeEmitter.fire('\x1b[u');
-
-        if (!noLock) {
-            this.mutex.unlock();
-        }
+            this.writeEmitter.fire(`\x1b[s\x1b[${this.dimension.rows};0H\x1b[2K`);
+            this.writeEmitter.fire(msg);
+            this.writeEmitter.fire('\x1b[u');
+        });
     }
 
     private inputLineFooter(): string {
@@ -307,6 +321,62 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
         const bottomLine = `${GREEN}└${'─'.repeat(headerWidth - 2)}┘${NO_COLOR}`;
 
         this.writeOnScreen(topLine + '\r\n' + contentLine + '\r\n' + bottomLine + '\r\n');
+    }
+
+    private enqueueWrite(work: () => void): void {
+        this.writeQueue = this.writeQueue.then(() => {
+            work();
+        }).catch((error) => {
+            this.handleError(error);
+        });
+    }
+
+    private handleAnsiSequence(data: string, startIndex: number): number {
+        let i = startIndex + 2;
+        let params = '';
+
+        for (; i < data.length; i++) {
+            const ch = data.charAt(i);
+            if ((ch >= '@' && ch <= '~')) {
+                this.applyAnsiCursorEffect(ch, params);
+                return i;
+            }
+            params += ch;
+        }
+
+        return startIndex;
+    }
+
+    private applyAnsiCursorEffect(finalChar: string, params: string): void {
+        const values = params
+            .split(';')
+            .filter((value) => value.length > 0)
+            .map((value) => Number(value));
+
+        const n = values.length > 0 && !Number.isNaN(values[0]) ? values[0] : 1;
+
+        switch (finalChar) {
+            case 'A':
+                this.cursorVerPos = Math.max(1, this.cursorVerPos - n);
+                break;
+            case 'B':
+                this.cursorVerPos = Math.min(this.dimension.rows, this.cursorVerPos + n);
+                break;
+            case 'E':
+                this.cursorVerPos = Math.min(this.dimension.rows, this.cursorVerPos + n);
+                break;
+            case 'F':
+                this.cursorVerPos = Math.max(1, this.cursorVerPos - n);
+                break;
+            case 'H':
+            case 'f': {
+                const row = values.length > 0 && !Number.isNaN(values[0]) ? values[0] : 1;
+                this.cursorVerPos = Math.min(Math.max(1, row), this.dimension.rows);
+                break;
+            }
+            default:
+                break;
+        }
     }
 
 }
