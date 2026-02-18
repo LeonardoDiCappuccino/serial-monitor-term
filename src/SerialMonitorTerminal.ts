@@ -37,7 +37,7 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
             this.setDimensions(initialDimensions);
         }
 
-        // this.writeEmitter.fire('\x1b[?25l');    // hiding cursor
+        this.writeEmitter.fire('\x1b[?25l');    // hiding cursor
         this.writeHeader();
     }
 
@@ -72,8 +72,8 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
 
             // Adjust cursor position
             if (this.cursorVerPos >= dimensions.rows) {
+                // this.writeEmitter.fire('\x1b[A');
                 this.cursorVerPos = dimensions.rows - 1;
-                this.writeEmitter.fire('\x1b[2K\n\x1b[A');
             }
         });
 
@@ -258,7 +258,7 @@ export class SerialMonitorTerminal implements vscode.Pseudoterminal {
                     this.cursorVerPos = Math.min(this.cursorVerPos + 1, this.dimension.rows);
 
                     if (this.cursorVerPos >= this.dimension.rows) {
-                        this.cursorVerPos--;
+                        this.cursorVerPos = this.dimension.rows - 1;
                         this.writeEmitter.fire(`\n\x1b[2K\n${this.inputLineFooter()}\x1b[${this.cursorVerPos}H`);
                         continue;
                     }
